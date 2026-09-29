@@ -203,6 +203,7 @@ from open_webui.tasks import (
     has_active_tasks,
     list_task_ids_by_item_id,
     list_tasks,
+    local_task_counts,
     redis_task_command_listener,
     redis_task_heartbeat,
     stop_item_tasks,
@@ -2137,6 +2138,11 @@ async def stop_task_endpoint(request: Request, task_id: str, user=Depends(get_ad
 @app.get('/api/tasks')
 async def list_tasks_endpoint(request: Request, user=Depends(get_admin_user)):
     return {'tasks': await list_tasks(request.app.state.redis)}
+
+
+@app.get('/api/tasks/stats')
+async def task_stats_endpoint(user=Depends(get_admin_user)):
+    return local_task_counts()
 
 
 @app.get('/api/tasks/chat/{chat_id:path}')

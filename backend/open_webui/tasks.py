@@ -1,10 +1,13 @@
 # tasks.py
 import asyncio
 import logging
+import os
+import time
 from contextlib import suppress
 from uuid import uuid4
 
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from open_webui.env import REDIS_KEY_PREFIX, REDIS_RESPONSE_STREAM_TTL, REDIS_TASK_TTL
 from open_webui.utils.json_codec import JSONCodec, dumps_bytes
@@ -15,6 +18,33 @@ log = logging.getLogger(__name__)
 tasks: dict[str, asyncio.Task] = {}
 item_tasks = {}
 response_streams: dict[str, dict] = {}
+_last_cleanup_warning = float('-inf')
+_cleanup_failures = 0
+
+
+def local_task_counts() -> dict[str, int]:
+    return {
+        'worker_pid': os.getpid(),
+        'active_tasks': sum(not task.done() for task in tasks.values()),
+        'retained_tasks': len(tasks),
+        'response_streams': len(response_streams),
+        'task_index_entries': sum(len(ids) for ids in item_tasks.values()),
+    }
+
+
+def report_cleanup_failure(error: Exception):
+    global _last_cleanup_warning, _cleanup_failures
+    _cleanup_failures += 1
+    now = time.monotonic()
+    if now - _last_cleanup_warning >= 60:
+        log.warning(
+            'OPENWEBUI_TASK_CLEANUP_FAILURE error_type=%s failures=%d counts=%s',
+            type(error).__name__,
+            _cleanup_failures,
+            local_task_counts(),
+        )
+        _last_cleanup_warning = now
+        _cleanup_failures = 0
 
 
 REDIS_TASKS_KEY = f'{REDIS_KEY_PREFIX}:tasks'
@@ -141,17 +171,22 @@ async def cleanup_task(redis, task_id: str, id=None):
     """
     Remove a completed or canceled task from the global `tasks` dictionary.
     """
-    if redis:
-        await redis_cleanup_task(redis, task_id, id)
-
     tasks.pop(task_id, None)  # Remove the task if it exists
     response_streams.pop(task_id, None)
 
-    # If an ID is provided, remove the task from the item_tasks dictionary
-    if id and task_id in item_tasks.get(id, []):
-        item_tasks[id].remove(task_id)
-        if not item_tasks[id]:  # If no tasks left for this ID, remove the entry
-            item_tasks.pop(id, None)
+    # Include entries left by versions that indexed tasks with no chat ID.
+    for item_id in {id, None, ''}:
+        if task_id in item_tasks.get(item_id, []):
+            item_tasks[item_id].remove(task_id)
+            if not item_tasks[item_id]:
+                item_tasks.pop(item_id, None)
+
+    if redis:
+        try:
+            async with asyncio.timeout(5):
+                await redis_cleanup_task(redis, task_id, id)
+        except (RedisError, OSError, TimeoutError) as error:
+            report_cleanup_failure(error)
 
 
 async def create_task(redis, coroutine, id=None, task_id=None):
@@ -174,6 +209,9 @@ async def create_task(redis, coroutine, id=None, task_id=None):
 
     if redis:
         await redis_save_task(redis, task_id, id)
+        # A fast task may finish while registration waits for Redis.
+        if task.done():
+            await cleanup_task(redis, task_id, id)
 
     return task_id, task
 
@@ -250,16 +288,23 @@ async def get_response_streams_by_chat_id(redis, chat_id: str) -> list[dict]:
 async def clear_response_stream(redis, task_id: str | None):
     if not task_id:
         return
+    response_streams.pop(task_id, None)
     if redis:
-        await redis.hdel(REDIS_RESPONSE_STREAMS_KEY, task_id)
-    else:
-        response_streams.pop(task_id, None)
+        try:
+            async with asyncio.timeout(5):
+                await redis.hdel(REDIS_RESPONSE_STREAMS_KEY, task_id)
+        except (RedisError, OSError, TimeoutError) as error:
+            report_cleanup_failure(error)
 
 
 async def stop_task(redis, task_id: str):
     """
     Cancel a running task and remove it from the global task list.
     """
+    local_task = tasks.get(task_id)
+    if local_task:
+        local_task.cancel()
+
     if redis:
         # Look up the item_id before cleanup so we can remove the set entry too
         item_id = await redis.hget(REDIS_TASKS_KEY, task_id)
